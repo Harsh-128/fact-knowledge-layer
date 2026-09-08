@@ -219,7 +219,11 @@ Fact type ID: {source_fact.fact_type_id}
 Attribute: {source_fact.attribute}
 Value: {source_fact.value}
 Unit: {source_fact.unit}
-Temporal scope: {source_fact.temporal_scope.model_dump()}
+Temporal scope: {
+    source_fact.temporal_scope.model_dump()
+    if source_fact.temporal_scope
+    else None
+}
 Evidence: {[e.model_dump_for_storage() for e in source_fact.evidence]}
 Confidence: {source_fact.confidence}
 
@@ -231,7 +235,11 @@ Fact type ID: {target_fact.fact_type_id}
 Attribute: {target_fact.attribute}
 Value: {target_fact.value}
 Unit: {target_fact.unit}
-Temporal scope: {target_fact.temporal_scope.model_dump()}
+Temporal scope: {
+    target_fact.temporal_scope.model_dump()
+    if target_fact.temporal_scope
+    else None
+}
 Evidence: {[e.model_dump_for_storage() for e in target_fact.evidence]}
 Confidence: {target_fact.confidence}
 
