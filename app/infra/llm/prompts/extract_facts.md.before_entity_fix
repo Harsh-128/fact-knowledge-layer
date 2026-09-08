@@ -51,99 +51,7 @@ document chunk.
 
 14. If no meaningful facts are present, return an empty `facts` list.
 
-### CRITICAL TABLE RULE
-
-For any table containing multiple numbers:
-
-- NEVER put multiple numbers into one fact.
-- NEVER return values such as "{1,860, 2,194, 2,076}".
-- NEVER return a list or set of values for a normal numerical table.
-- ONE fact = ONE number = ONE period.
-- The `value` field must contain exactly ONE value.
-- The `temporal_scope.period_label` must identify the column containing that value.
-- The `quoted_text` MUST contain the exact numerical value being extracted.
-- If you cannot determine which period belongs to a number, DO NOT extract it.
-
-Example:
-
-SOURCE:
-Q4 FY23    Q3 FY24    Q4 FY24
-Revenue
-1,860      2,194      2,076
-
-Return THREE separate facts:
-
-Fact 1:
-attribute = "revenue"
-value = "1860"
-temporal_scope.period_label = "Q4 FY23"
-
-Fact 2:
-attribute = "revenue"
-value = "2194"
-temporal_scope.period_label = "Q3 FY24"
-
-Fact 3:
-attribute = "revenue"
-value = "2076"
-temporal_scope.period_label = "Q4 FY24"
-
-Each fact must have evidence containing its own number.
-
 ## Entity Extraction
-
-For every fact, identify the real-world entity that the fact is about.
-
-- `entity_name`
-- `entity_type`
-
-IMPORTANT ENTITY RULES:
-
-1. The entity is the subject that owns, reports, measures, operates, or is
-   otherwise described by the fact.
-
-2. NEVER use a metric name, attribute name, table row label, column header,
-   section heading, unit, period, or value as the entity.
-
-3. Examples of things that are NOT entities:
-   - "Revenue from customers"
-   - "Revenue from services"
-   - "Adjusted EBITDA"
-   - "Q4 FY24"
-   - "₹ Cr"
-   - "YoY"
-   - "Total revenue"
-
-4. For financial tables, row labels such as "Revenue from customers" describe
-   the ATTRIBUTE, not the ENTITY.
-
-5. If the source text explicitly names the company or organization elsewhere
-   in the supplied chunk, use that name as the entity for facts in that
-   table.
-
-6. If the supplied chunk contains a financial table but does not contain
-   enough information to identify which entity the table belongs to, do NOT
-   invent an entity. Return no fact rather than using a row label as the
-   entity.
-
-7. Do not use outside knowledge to determine the entity.
-
-Examples:
-
-SOURCE:
-"Example Company
-Revenue from customers (₹ Cr)
-Q4 FY24: 2,076"
-
-VALID:
-entity_name = "Example Company"
-attribute = "revenue"
-value = 2076
-unit = "INR crore"
-temporal_scope = "Q4 FY24"
-
-INVALID:
-entity_name = "Revenue from customers"
 
 For every fact, identify:
 
@@ -270,29 +178,6 @@ Before returning ANY fact, perform these checks internally:
 
 7. For tables, extract a fact only when the relevant row/cell and enough
    table context are actually present in the supplied SOURCE TEXT.
-
-8. For tables, NEVER combine multiple cells or periods into a set, list,
-   or object unless the source explicitly presents that structure.
-
-9. Each numerical table fact MUST correspond to one specific value and
-   one specific column/period.
-
-10. If a table has multiple period columns such as Q4 FY23, Q3 FY24, and
-    Q4 FY24, create separate facts for each value only when the column
-    mapping is explicitly recoverable from the supplied source text.
-
-11. The temporal_scope MUST identify the specific column/period associated
-    with the extracted value. Do not leave temporal_scope empty when the
-    table explicitly provides the period.
-
-12. The quoted evidence for a numerical table fact MUST include the
-    numerical value being extracted. A row label by itself is insufficient.
-
-13. The unit from a table heading applies to its values only when that
-    heading is present in the supplied source text. Preserve that unit.
-
-14. If the table formatting is too ambiguous to reliably map a value to
-    its period, return no fact rather than guessing.
 
 The safest behavior is to return fewer facts rather than return a fact
 without exact evidence.

@@ -1,0 +1,419 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from uuid import uuid4
+
+from app.core.exceptions import FactExtractionError
+from app.domain.models.chunk import Chunk
+from app.domain.models.document import Document
+from app.domain.models.fact import Fact
+from app.domain.services.entity_resolution_service import EntityResolutionService
+from app.domain.value_objects.evidence_ref import EvidenceRef
+from app.domain.value_objects.temporal_scope import TemporalScope
+from app.infra.llm.client import LLMClient
+from app.infra.llm.schemas import (
+    ExtractedFact,
+    FactExtractionResponse,
+)
+
+
+PROMPT_FILE = (
+    Path(__file__).resolve().parents[2]
+    / "infra"
+    / "llm"
+    / "prompts"
+    / "extract_facts.md"
+)
+
+
+def load_extraction_prompt() -> str:
+    """
+    Load the fact extraction instructions from the prompt file.
+    """
+
+    if not PROMPT_FILE.exists():
+        raise FactExtractionError(
+            f"Extraction prompt file not found: {PROMPT_FILE}"
+        )
+
+    try:
+        prompt = PROMPT_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise FactExtractionError(
+            f"Unable to read extraction prompt: {exc}"
+        ) from exc
+
+    if not prompt.strip():
+        raise FactExtractionError(
+            "Extraction prompt file is empty."
+        )
+
+    return prompt
+
+
+class FactExtractionService:
+    """
+    Extract source-grounded facts from document chunks.
+
+    This service converts LLM extraction results into domain Fact objects
+    and resolves extracted entity mentions to canonical entities.
+    """
+
+    def __init__(
+        self,
+        llm_client: LLMClient | None = None,
+        entity_resolution_service: EntityResolutionService | None = None,
+    ) -> None:
+        self.llm_client = llm_client or LLMClient()
+        self.entity_resolution_service = (
+            entity_resolution_service or EntityResolutionService()
+        )
+
+    def extract_from_chunk(
+        self,
+        chunk: Chunk,
+        document: Document,
+    ) -> list[Fact]:
+        """
+        Extract facts from one document chunk.
+        """
+
+        if chunk.document_id != document.id:
+            raise FactExtractionError(
+                "Chunk document_id does not match the supplied document ID."
+            )
+
+        if not chunk.text.strip():
+            return []
+
+        system_prompt = load_extraction_prompt()
+
+        user_prompt = self._build_user_prompt(
+            chunk=chunk,
+            document=document,
+        )
+
+        response = self.llm_client.generate_structured(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_model=FactExtractionResponse,
+        )
+
+        facts: list[Fact] = []
+
+        for extracted_fact in response.facts:
+            try:
+                fact = self._convert_extracted_fact(
+                    extracted_fact=extracted_fact,
+                    chunk=chunk,
+                    document=document,
+                )
+            except FactExtractionError as exc:
+                # Keep valid facts even when one LLM-produced fact
+                # cannot be grounded to exact evidence.
+                print(
+                    f"Skipping unsupported extracted fact "
+                    f"'{extracted_fact.attribute}': {exc}"
+                )
+                continue
+
+            if len(facts) >= 5:
+                break
+
+            if not any(
+                existing.attribute == fact.attribute
+                and existing.value == fact.value
+                and existing.entity_id == fact.entity_id
+                and existing.fact_type_id == fact.fact_type_id
+                and existing.evidence == fact.evidence
+                for existing in facts
+            ):
+                facts.append(fact)
+
+        return facts
+
+    def extract_from_chunks(
+        self,
+        chunks: list[Chunk],
+        document: Document,
+    ) -> list[Fact]:
+        """
+        Extract facts from multiple chunks.
+        """
+
+        facts: list[Fact] = []
+
+        for chunk in chunks:
+            facts.extend(
+                self.extract_from_chunk(
+                    chunk=chunk,
+                    document=document,
+                )
+            )
+
+        return facts
+
+    @staticmethod
+    def _build_user_prompt(
+        *,
+        chunk: Chunk,
+        document: Document,
+    ) -> str:
+        """
+        Build the extraction prompt for a single source chunk.
+        """
+
+        return f"""
+Document ID: {document.id}
+Document filename: {document.filename}
+
+Source page: {chunk.page_number}
+Source chunk ID: {chunk.id}
+Source chunk character range: {chunk.char_start} - {chunk.char_end}
+
+Extract ONLY meaningful, distinct facts from the following source text.
+
+Rules:
+- Return at most 5 facts.
+- Never repeat the same fact.
+- Do NOT return a document title, standalone company name, or repeated heading as a fact.
+- Prefer factual statements containing meaningful attributes, values, metrics, relationships, or descriptions.
+- If there are no meaningful facts, return an empty facts list.
+
+--- SOURCE TEXT START ---
+{chunk.text}
+--- SOURCE TEXT END ---
+
+For every extracted fact:
+- provide the entity,
+- provide a reusable fact type,
+- provide a normalized attribute,
+- provide the value,
+- provide the unit when applicable,
+- provide temporal scope when available,
+- provide exact quoted evidence,
+- provide the page number,
+- provide the source chunk ID,
+- provide confidence between 0 and 1.
+
+The quoted evidence must be copied exactly from the source text.
+"""
+
+    def _convert_extracted_fact(
+        self,
+        *,
+        extracted_fact: ExtractedFact,
+        chunk: Chunk,
+        document: Document,
+    ) -> Fact:
+        """
+        Convert the LLM boundary schema into the domain Fact model.
+        """
+
+        evidence_refs = self._build_evidence_refs(
+            extracted_fact=extracted_fact,
+            chunk=chunk,
+            document=document,
+        )
+
+        if not evidence_refs:
+            raise FactExtractionError(
+                f"Extracted fact '{extracted_fact.attribute}' has no valid evidence."
+            )
+
+        temporal_scope = self._convert_temporal_scope(
+            extracted_fact.temporal_scope,
+        )
+
+        entity = self.entity_resolution_service.resolve(
+            mention=extracted_fact.entity_name,
+            entity_type=extracted_fact.entity_type,
+        )
+
+        return Fact(
+            id=f"fact-{uuid4().hex}",
+            document_id=document.id,
+            chunk_id=chunk.id,
+            entity_id=entity.id,
+            fact_type_id=self._temporary_fact_type_id(
+                extracted_fact.fact_type_name,
+            ),
+            attribute=extracted_fact.attribute.strip(),
+            value=self._normalize_extracted_value(
+                extracted_fact.value,
+            ),
+            unit=(
+                extracted_fact.unit.strip()
+                if extracted_fact.unit
+                else None
+            ),
+            temporal_scope=temporal_scope,
+            evidence=evidence_refs,
+            confidence=extracted_fact.confidence,
+            needs_review=(
+                extracted_fact.confidence < 0.8
+                or bool(extracted_fact.extraction_notes)
+            ),
+            extraction_method="llm",
+            raw_extraction=extracted_fact.model_dump(
+                mode="json",
+            ),
+        )
+
+    @staticmethod
+    def _normalize_extracted_value(value: str):
+        """
+        Convert Gemini's string-based fact value into a useful Python value.
+        """
+
+        if not isinstance(value, str):
+            return value
+
+        normalized = value.strip()
+
+        if not normalized:
+            return normalized
+
+        try:
+            parsed = json.loads(normalized)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if parsed is not None:
+            return parsed
+
+        return normalized
+
+    @staticmethod
+    def _build_evidence_refs(
+        *,
+        extracted_fact: ExtractedFact,
+        chunk: Chunk,
+        document: Document,
+    ) -> list[EvidenceRef]:
+        """
+        Convert LLM evidence into domain EvidenceRef objects.
+
+        Evidence is accepted only when:
+        - the page matches the source chunk,
+        - the quote is non-empty,
+        - the quote actually exists in the source chunk.
+        """
+
+        evidence_refs: list[EvidenceRef] = []
+
+        for evidence in extracted_fact.evidence:
+            quoted_text = evidence.quoted_text.strip()
+
+            if not quoted_text:
+                continue
+
+            if evidence.page_number != chunk.page_number:
+                continue
+
+            quote_position = chunk.text.find(quoted_text)
+
+            if quote_position == -1:
+                continue
+
+            char_start = (
+                chunk.char_start + quote_position
+                if chunk.char_start is not None
+                else quote_position
+            )
+
+            char_end = char_start + len(quoted_text)
+
+            evidence_refs.append(
+                EvidenceRef(
+                    document_id=document.id,
+                    page_number=chunk.page_number,
+                    chunk_id=chunk.id,
+                    quoted_text=quoted_text,
+                    char_start=char_start,
+                    char_end=char_end,
+                )
+            )
+
+        return evidence_refs
+
+    @staticmethod
+    def _convert_temporal_scope(
+        temporal_scope,
+    ) -> TemporalScope | None:
+        """
+        Convert the LLM temporal representation into the domain model.
+        """
+
+        if temporal_scope is None:
+            return None
+
+        from datetime import date
+
+        start_date = None
+        end_date = None
+
+        if temporal_scope.start_date:
+            try:
+                start_date = date.fromisoformat(
+                    temporal_scope.start_date,
+                )
+            except ValueError:
+                pass
+
+        if temporal_scope.end_date:
+            try:
+                end_date = date.fromisoformat(
+                    temporal_scope.end_date,
+                )
+            except ValueError:
+                pass
+
+        return TemporalScope(
+            start_date=start_date,
+            end_date=end_date,
+            period_label=temporal_scope.period_label,
+            granularity=temporal_scope.granularity,
+        )
+
+    @staticmethod
+    def _temporary_entity_id(entity_name: str) -> str:
+        """
+        Create a temporary entity key.
+
+        This method is retained for backward compatibility. New facts
+        use EntityResolutionService and therefore receive canonical
+        persistent entity IDs.
+        """
+
+        normalized = " ".join(entity_name.lower().split())
+
+        return f"mention:{normalized}"
+
+    @staticmethod
+    def _temporary_fact_type_id(fact_type_name: str) -> str:
+        """
+        Create a temporary fact-type key.
+
+        The schema registry will later map this to a persistent
+        versioned fact type.
+        """
+
+        normalized = " ".join(fact_type_name.lower().split())
+
+        return f"type:{normalized}"
+
+
+def get_extraction_service(
+    llm_client: LLMClient | None = None,
+    entity_resolution_service: EntityResolutionService | None = None,
+) -> FactExtractionService:
+    """
+    Return a fact extraction service.
+    """
+
+    return FactExtractionService(
+        llm_client=llm_client,
+        entity_resolution_service=entity_resolution_service,
+    )

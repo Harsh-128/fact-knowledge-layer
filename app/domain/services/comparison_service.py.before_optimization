@@ -99,8 +99,9 @@ class FactComparisonService:
         """
         Compare facts that belong to the same comparison subject.
 
-        Exact duplicate facts are corroborations and do not require an
-        LLM call. Ambiguous pairs are delegated to the LLM.
+        Pairwise comparison is intentionally performed only within
+        compatible groups to avoid an unnecessary O(n²) comparison
+        across the entire knowledge base.
         """
 
         relationships: list[Relationship] = []
@@ -113,27 +114,6 @@ class FactComparisonService:
                 ):
                     continue
 
-                if self._is_exact_duplicate(source_fact, target_fact):
-                    relationships.append(
-                        self._build_relationship(
-                            source_fact=source_fact,
-                            target_fact=target_fact,
-                            relationship_type=RelationshipType.CORROBORATES,
-                            confidence=1.0,
-                            explanation=(
-                                "The facts have the same entity, attribute, "
-                                "value, unit, and temporal scope, so they "
-                                "corroborate each other without requiring "
-                                "semantic inference."
-                            ),
-                            needs_review=(
-                                source_fact.needs_review
-                                or target_fact.needs_review
-                            ),
-                        )
-                    )
-                    continue
-
                 relationships.append(
                     self.compare(
                         source_fact,
@@ -142,39 +122,6 @@ class FactComparisonService:
                 )
 
         return relationships
-
-    @staticmethod
-    def _is_exact_duplicate(
-        source_fact: Fact,
-        target_fact: Fact,
-    ) -> bool:
-        """
-        Detect facts whose structured meaning is already identical.
-
-        This avoids an unnecessary LLM call and prevents the model from
-        inventing temporal or unit context for identical facts.
-        """
-
-        source_scope = (
-            source_fact.temporal_scope.model_dump()
-            if source_fact.temporal_scope
-            else None
-        )
-        target_scope = (
-            target_fact.temporal_scope.model_dump()
-            if target_fact.temporal_scope
-            else None
-        )
-
-        return (
-            source_fact.entity_id == target_fact.entity_id
-            and source_fact.attribute.strip().lower()
-            == target_fact.attribute.strip().lower()
-            and source_fact.fact_type_id == target_fact.fact_type_id
-            and source_fact.value == target_fact.value
-            and source_fact.unit == target_fact.unit
-            and source_scope == target_scope
-        )
 
     def _compare_with_llm(
         self,
